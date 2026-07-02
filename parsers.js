@@ -162,7 +162,7 @@ Parsers.hsbc = async function (arrayBuffer, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const worker = await Tesseract.createWorker("eng", 1, {
     workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/worker.min.js",
-    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4/tesseract-core-simd-lstm.wasm.js",
+    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4",
     langPath: "https://tessdata.projectnaptha.com/4.0.0",
     logger: (m) => { if (onProgress && m.status === "recognizing text") onProgress(`OCR ${Math.round((m.progress || 0) * 100)}%…`); },
   });
