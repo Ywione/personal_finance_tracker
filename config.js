@@ -4,7 +4,7 @@
 // it's safe to commit to a public GitHub repo.
 
 const LEDGER_CONFIG = {
-  GOOGLE_CLIENT_ID: "YOUR_CLIENT_ID.apps.googleusercontent.com",
+  GOOGLE_CLIENT_ID: "1008976129886-u3a3tjhctmqptqs35tfa8thg5918rb9j.apps.googleusercontent.com",
 
   // Drive scope: appdata = a hidden, app-private folder in the
   // signed-in user's own Drive. No other app, and no person
