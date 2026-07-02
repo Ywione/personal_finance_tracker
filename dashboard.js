@@ -39,17 +39,19 @@ const Dashboard = (() => {
     return byCat;
   }
 
-  // Simple return approximation: (endNAV - startNAV - netFlows) / startNAV
-  // Good enough for a monthly personal dashboard; not a substitute for
-  // IBKR's own TWR report if you need precision.
-  function investmentReturn(navRows) {
-    if (!navRows || navRows.length < 1) return null;
-    const start = parseFloat(navRows[0]["Starting Value"] || navRows[0]["Total"] || 0);
-    const end = parseFloat(navRows[0]["Ending Value"] || navRows[0]["Total"] || 0);
-    const deposits = parseFloat(navRows[0]["Deposits & Withdrawals"] || 0);
-    if (!start) return null;
-    const pnl = end - start - deposits;
-    return { start, end, deposits, pnl, returnPct: (pnl / start) * 100 };
+  // Prefers IBKR's own Time-Weighted Rate of Return (already correctly
+  // isolates market performance from cash flows) over any home-grown
+  // calculation — combining the statement's NAV change with a
+  // differently-windowed cash-flow figure risks mixing periods.
+  function investmentReturn(nav) {
+    if (!nav || isNaN(nav.start) || !nav.start) return null;
+    return {
+      start: nav.start,
+      end: nav.end,
+      change: nav.end - nav.start,
+      twrPct: nav.twrPct,
+      netFlowsMTD: nav.netFlowsMTD,
+    };
   }
 
   function renderSpendVsSave(byMonth) {
