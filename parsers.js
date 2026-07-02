@@ -20,10 +20,19 @@ Parsers.monzo = function (fileText) {
       const moneyIn = parseFloat(row["Money In"]) || 0;
       amount = moneyOut + moneyIn;
     }
+    // Linkage: moves between the person's own accounts shouldn't count
+    // as income or spend. Covers Monzo savings pots ("Pot transfer" type
+    // or "Savings Pot" name) and any transfer referencing HSBC.
+    const type = row["Type"] || "";
+    const name = row["Name"] || "";
+    let category = row["Category"] || "";
+    if (/pot transfer/i.test(type) || /savings pot/i.test(name) || /hsbc/i.test(name + " " + (row["Description"] || ""))) {
+      category = "Internal Transfer";
+    }
     return {
       date: normalizeUKDate(row["Date"]), // Monzo exports DD/MM/YYYY
-      description: row["Name"] || row["Description"] || "",
-      category: row["Category"] || "",
+      description: name || row["Description"] || "",
+      category,
       amount,
       currency: row["Currency"] || row["Local currency"] || "GBP",
       source: "monzo",
@@ -217,12 +226,18 @@ function reflowWords(words) {
 }
 
 // Reconstructs transactions from OCR'd statement lines using the
-// running balance: every "Deposits/Withdrawals/Balance" row shows the
-// new balance, so amount = newBalance - previousBalance. This sidesteps
-// having to trust OCR's read of which of two numbers on a line is the
-// transaction amount vs. the balance, and survives transactions that
-// get split across a page break (common — see BALANCE CARRIED/BROUGHT
-// FORWARD handling below).
+// running balance: every amounts row shows the new balance, so
+// amount = newBalance - previousBalance. This sidesteps having to trust
+// OCR's read of which number is the amount vs. the balance, and survives
+// transactions split across page breaks.
+//
+// It also enriches each row with HSBC-specific structure:
+//  - account name + currency from each section's header line
+//  - counterparty (merchant / payee), pulled from the descriptive lines
+//    of the block (HSBC prints it below the PURCHASE/CASH line)
+//  - FX purchase tax (the 1.25% FCPT levy on non-BMD transactions)
+//  - classification: BMA income, internal transfers between own accounts,
+//    IBKR / Monzo linkages, cash withdrawals, fees
 function parseHsbcLines(lines) {
   const SKIP = [
     /^HSBC\b/i, /^Page \d+ of \d+/i, /Composite Statement/i,
@@ -246,8 +261,11 @@ function parseHsbcLines(lines) {
   let previousBalance = null;
   let currentDate = null;
   let account = null;
+  let accountName = null;
+  let accountCurrency = "BMD";
   let buffer = [];
-  let tableActive = false; // gates out pre-table summary tables (e.g. "Summary of Your Portfolio")
+  let tableActive = false;
+  const ownAccounts = new Set();
   const rows = [];
 
   const parseAmount = (numStr, dr) => {
@@ -259,17 +277,26 @@ function parseHsbcLines(lines) {
     const line = rawLine.trim();
     if (!line) continue;
 
-    // The account/branch header line repeats at the top of every page for
-    // the SAME account (it's a running header, not a new section) — only
-    // treat it as a reset when the account number actually changes.
     const acctMatch = line.match(ACCOUNT_HEADER);
     if (acctMatch) {
       if (acctMatch[1] !== account) {
         account = acctMatch[1];
+        ownAccounts.add(account);
         previousBalance = null;
         currentDate = null;
         buffer = [];
         tableActive = false;
+        // Section header carries the account's product name and currency,
+        // e.g. "(QUARTERLY BONUS SAVE  Account Number 011-256617-012  Branch 011  Currency BMD"
+        const nameMatch = line.match(/^\(?\s*([A-Z][A-Z'&\s]+?)\s+Account Number/i);
+        const curMatch = line.match(/Currency\s+([A-Z]{3})/i);
+        accountCurrency = curMatch ? curMatch[1].toUpperCase() : "BMD";
+        // OCR sometimes clips the first characters of the header (e.g.
+        // "(SBC BANK ACCOUNT"), so normalize to known product names.
+        const rawName = nameMatch ? nameMatch[1].trim() : "";
+        if (/BONUS SAVE/i.test(rawName)) accountName = `Quarterly Bonus Save (${accountCurrency})`;
+        else if (/BANK ACCOUNT/i.test(rawName)) accountName = `HSBC Bank Account (${accountCurrency})`;
+        else accountName = rawName ? `${rawName} (${accountCurrency})` : null;
       }
       continue;
     }
@@ -280,9 +307,8 @@ function parseHsbcLines(lines) {
     }
 
     if (SKIP.some((re) => re.test(line))) continue;
-    if (!tableActive) continue; // still in the pre-table summary section
+    if (!tableActive) continue;
 
-    // Pull a date token out if present (tolerant of OCR noise like "O06Apr2026")
     const dateMatch = line.match(/(\d{1,2}[A-Za-z]{3}\d{4})/);
     let working = line;
     if (dateMatch) {
@@ -296,7 +322,10 @@ function parseHsbcLines(lines) {
         const last = nums[nums.length - 1];
         previousBalance = parseAmount(last[1], last[2]);
       }
-      buffer = [];
+      // Deliberately do NOT clear the buffer: when a transaction's
+      // description lines land at the bottom of one page and its amounts
+      // row at the top of the next, the CARRIED/BROUGHT FORWARD pair sits
+      // between them — clearing here would orphan the description.
       continue;
     }
 
@@ -309,17 +338,22 @@ function parseHsbcLines(lines) {
         ? Math.round((newBalance - previousBalance) * 100) / 100
         : parseAmount(amtTok[1], null);
 
-      let desc = working.slice(0, amtTok.index).trim();
-      if (buffer.length) desc = (buffer.join(" ") + " " + desc).replace(/\s+/g, " ").trim();
+      const tail = working.slice(0, amtTok.index).trim();
+      const blockLines = tail ? [...buffer, tail] : [...buffer];
 
+      const enriched = enrichHsbcBlock(blockLines, amount, ownAccounts);
       rows.push({
         date: currentDate,
-        description: desc || "(description unclear — OCR)",
+        description: enriched.description,
+        counterparty: enriched.counterparty,
+        category: enriched.category,
+        fxTax: enriched.fxTax,
         amount,
-        currency: "BMD",
+        currency: accountCurrency,
         account,
+        accountName,
         source: "hsbc",
-        raw: line,
+        raw: blockLines.join(" | "),
       });
       previousBalance = newBalance;
       buffer = [];
@@ -330,6 +364,75 @@ function parseHsbcLines(lines) {
   }
 
   return rows;
+}
+
+// HSBC block structure (top to bottom): a PURCHASE/CASH line with the
+// original datetime, a card/txn code+currency+FX-amount line, the
+// counterparty name, optional BK CHG / FCPT (foreign currency purchase
+// tax, levied at 1.25% on non-BMD transactions) lines, then the REF line
+// that carries the BMD amounts. The counterparty is the descriptive text
+// that is none of those boilerplate patterns.
+function enrichHsbcBlock(blockLines, amount, ownAccounts) {
+  const BOILER = [
+    /^PURCHASE\b/i, /^CASH\b/i, /^REF\b/i, /^BK CHG\b/i, /^FCPT\b/i,
+    /^LP\b/i, /^TT\b/i, /^WEB-/i, /^[A-Z]{2}\d{6,}(USD|BMD|GBP|EUR)/,
+    /^\d{7,}$/, /^FROM\s+[\d\-]+/i, /^TO\s+[\d\-]+/i,
+    /^SAVINGS ACCOUNT FEE/i, /^\d{2}[A-Z]{3}\d{2}\s+TO\s+\d{2}[A-Z]{3}\d{2}/i,
+    /^CREDIT INTEREST/i, /^TRANSFER FROM$/i, /^COMMISSION\b/i,
+  ];
+  const text = blockLines.join(" ");
+
+  // Drop OCR junk that leaks in from page borders/footers when a block
+  // spans a page break: fragments like "N y,", "(HSBC »", or any line
+  // without enough real letters to be a name.
+  const isJunk = (l) => {
+    const t = l.trim();
+    if (/HSBC/i.test(t) && t.length < 12) return true;
+    return t.replace(/[^A-Za-z0-9]/g, "").length < 3;
+  };
+  let fxTax = 0;
+  for (const m of text.matchAll(/FCPT\s*@?\s*\.?0?125\s*BMD\s*([\d,]+\.\d{2})/gi)) {
+    fxTax += parseFloat(m[1].replace(/,/g, ""));
+  }
+  fxTax = Math.round(fxTax * 100) / 100 || 0;
+
+  // Counterparty: descriptive lines that aren't boilerplate or OCR junk
+  const textyLines = blockLines.filter((l) => !isJunk(l) && !BOILER.some((re) => re.test(l.trim())));
+  let counterparty = textyLines.join(" ").replace(/\s+/g, " ").trim();
+
+  // Classification
+  let category = "";
+  const ownTransfer = text.match(/(?:FROM|TO)\s+(011-256617-\d{3})/i);
+
+  if (/BERMUDA MONETARY AUT/i.test(text)) {
+    category = "Income";
+    counterparty = "Bermuda Monetary Authority" + (counterparty ? ` — ${counterparty.replace(/BERMUDA MONETARY AUT/i, "").trim()}` : "");
+  } else if (/CREDIT INTEREST/i.test(text)) {
+    category = "Income";
+    counterparty = counterparty || "Credit interest";
+  } else if (/Interactive Brokers/i.test(text) || /U8028484/i.test(text)) {
+    category = "Investing";
+    counterparty = "Interactive Brokers (IBKR)";
+  } else if (/MONZO/i.test(text)) {
+    category = "Internal Transfer";
+    counterparty = "Monzo (own account)";
+  } else if (ownTransfer) {
+    category = "Internal Transfer";
+    counterparty = `Own account ${ownTransfer[1]}`;
+  } else if (/\bTO\s+\d{3}-\d{6}-\d{3}/i.test(text)) {
+    category = "Transfer Out";
+    const acct = text.match(/TO\s+(\d{3}-\d{6}-\d{3})/i);
+    counterparty = counterparty || (acct ? `Account ${acct[1]}` : "External transfer");
+  } else if (/SAVINGS ACCOUNT FEE/i.test(text)) {
+    category = "Fees";
+    counterparty = "Savings account fee";
+  } else if (blockLines.some((l) => /^CASH\b/i.test(l.trim()))) {
+    category = amount < 0 ? "Cash Withdrawal" : "Cash Deposit";
+    counterparty = counterparty || (amount < 0 ? "Cash withdrawal" : "Cash deposit");
+  }
+
+  const description = counterparty || blockLines[blockLines.length - 1] || "(unclear — check raw)";
+  return { counterparty, category, fxTax, description };
 }
 
 function normalizeHsbcDate(tok) {
