@@ -70,24 +70,35 @@ function initUploads() {
   $("#ibkrFile").addEventListener("change", async (e) => {
     const text = await e.target.files[0].text();
     const result = Parsers.ibkr(text);
-    queueReview(Categorize.applyTo(result.transactions));
-    if (result.nav && result.nav.length) {
+    if (result.transactions.length) queueReview(Categorize.applyTo(result.transactions));
+    if (!isNaN(result.nav.start) && !isNaN(result.nav.end)) {
       STATE.navHistory.push({ importedAt: new Date().toISOString(), nav: result.nav });
+      saveToDrive();
+      renderDashboard();
+    }
+    if (!result.transactions.length && isNaN(result.nav.start)) {
+      alert("Didn't find a Change in NAV or transaction section in this file — check it's an IBKR Activity Statement or Flex Query CSV.");
+    } else {
+      alert("Investment return updated on the Dashboard tab" + (result.transactions.length ? ` and ${result.transactions.length} row(s) added to review.` : "."));
     }
   });
 
   $("#hsbcFile").addEventListener("change", async (e) => {
-    const buf = await e.target.files[0].arrayBuffer();
-    let customRe = null;
-    const custom = $("#hsbcRegex").value.trim();
-    if (custom) {
-      try { customRe = new RegExp(custom, "gm"); } catch { alert("Invalid custom regex, using default."); }
+    const file = e.target.files[0];
+    const statusEl = $("#hsbcStatus");
+    const buf = await file.arrayBuffer();
+    try {
+      const rows = await Parsers.hsbc(buf, (msg) => { statusEl.textContent = msg; });
+      statusEl.textContent = `Done — ${rows.length} row(s) found. Check them below before saving.`;
+      if (!rows.length) {
+        alert("No transactions were recognized. The scan quality or layout may be throwing off OCR — try re-exporting the PDF, or paste a page of the extracted text to me in chat and I can tune the parser.");
+      }
+      queueReview(Categorize.applyTo(rows));
+    } catch (err) {
+      statusEl.textContent = "OCR failed — see console for details.";
+      console.error(err);
+      alert("Something went wrong reading the PDF: " + err.message);
     }
-    const rows = await Parsers.hsbc(buf, customRe);
-    if (!rows.length) {
-      alert("No transactions matched. Open Settings and adjust the HSBC line pattern to match your statement's layout, then try again.");
-    }
-    queueReview(Categorize.applyTo(rows));
   });
 }
 
@@ -180,9 +191,14 @@ function renderDashboard() {
   if (STATE.navHistory.length) {
     const last = STATE.navHistory[STATE.navHistory.length - 1];
     const ret = Dashboard.investmentReturn(last.nav);
-    invBox.textContent = ret
-      ? `Last import: NAV ${ret.start.toFixed(2)} → ${ret.end.toFixed(2)}, net flows ${ret.deposits.toFixed(2)}, P&L ${ret.pnl.toFixed(2)} (${ret.returnPct.toFixed(2)}%)`
-      : "Import an IBKR Flex Query with a Change in NAV section to see return figures here.";
+    if (ret) {
+      const parts = [`NAV ${ret.start.toFixed(2)} → ${ret.end.toFixed(2)} (${ret.change >= 0 ? "+" : ""}${ret.change.toFixed(2)})`];
+      if (ret.twrPct !== null && !isNaN(ret.twrPct)) parts.push(`time-weighted return ${ret.twrPct.toFixed(2)}%`);
+      if (ret.netFlowsMTD) parts.push(`net deposits/withdrawals this month: ${ret.netFlowsMTD >= 0 ? "+" : ""}${ret.netFlowsMTD.toFixed(2)}`);
+      invBox.textContent = "Last import — " + parts.join(", ") + ".";
+    } else {
+      invBox.textContent = "This IBKR file didn't include a Change in NAV section — export an Activity Statement or Flex Query that includes it to see return figures here.";
+    }
   } else {
     invBox.textContent = "No IBKR data imported yet.";
   }
