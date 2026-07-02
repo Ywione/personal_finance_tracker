@@ -53,11 +53,22 @@ async function loadFromDrive() {
 }
 
 async function saveToDrive() {
-  await Promise.all([
-    DriveStore.writeJSON(LEDGER_CONFIG.FILES.transactions, STATE.transactions),
-    DriveStore.writeJSON(LEDGER_CONFIG.FILES.rules, Categorize.getRules()),
-    DriveStore.writeJSON(LEDGER_CONFIG.FILES.investments, STATE.navHistory),
-  ]);
+  if (!Auth.isSignedIn()) {
+    alert("You're not signed in — sign in with Google first, then re-import this file so it can be saved.");
+    return false;
+  }
+  try {
+    await Promise.all([
+      DriveStore.writeJSON(LEDGER_CONFIG.FILES.transactions, STATE.transactions),
+      DriveStore.writeJSON(LEDGER_CONFIG.FILES.rules, Categorize.getRules()),
+      DriveStore.writeJSON(LEDGER_CONFIG.FILES.investments, STATE.navHistory),
+    ]);
+    return true;
+  } catch (err) {
+    console.error(err);
+    alert("Couldn't save to Drive: " + err.message);
+    return false;
+  }
 }
 
 // ---- Upload → parse → review pipeline --------------------------------
@@ -73,7 +84,7 @@ function initUploads() {
     if (result.transactions.length) queueReview(Categorize.applyTo(result.transactions));
     if (!isNaN(result.nav.start) && !isNaN(result.nav.end)) {
       STATE.navHistory.push({ importedAt: new Date().toISOString(), nav: result.nav });
-      saveToDrive();
+      await saveToDrive();
       renderDashboard();
     }
     if (!result.transactions.length && isNaN(result.nav.start)) {
@@ -142,9 +153,9 @@ async function commitReview() {
   STATE.pendingReview = [];
   renderReviewTable();
   renderTransactionsTable();
-  await saveToDrive();
+  const saved = await saveToDrive();
   renderDashboard();
-  alert("Saved to your private Drive folder.");
+  if (saved) alert("Saved to your private Drive folder.");
 }
 
 // ---- Transactions table ------------------------------------------------
