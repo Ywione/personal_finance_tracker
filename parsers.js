@@ -160,10 +160,10 @@ Parsers.ibkr = function (fileText) {
 // OCR occasionally misreads a character.
 Parsers.hsbc = async function (arrayBuffer, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  // Tesseract.js v5 — its default worker/core/language paths (all on
+  // jsDelivr) are correct out of the box; overriding them was the cause
+  // of earlier init failures, so we deliberately don't.
   const worker = await Tesseract.createWorker("eng", 1, {
-    workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/worker.min.js",
-    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4",
-    langPath: "https://tessdata.projectnaptha.com/4.0.0",
     logger: (m) => { if (onProgress && m.status === "recognizing text") onProgress(`OCR ${Math.round((m.progress || 0) * 100)}%…`); },
   });
   const allLines = [];
