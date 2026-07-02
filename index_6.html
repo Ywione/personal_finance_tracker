@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ledger — Personal Finance Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">
+    <span class="brand-mark">Ledger</span>
+    <span class="brand-sub">private monthly tracker</span>
+  </div>
+  <div class="auth-controls">
+    <span id="authStatus" class="auth-status">Not signed in</span>
+    <button id="signInBtn" class="btn btn-primary">Sign in with Google</button>
+    <button id="signOutBtn" class="btn" style="display:none">Sign out</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="upload">Upload</button>
+  <button class="tab-btn" data-tab="dashboard">Dashboard</button>
+  <button class="tab-btn" data-tab="transactions">Transactions</button>
+  <button class="tab-btn" data-tab="settings">Settings</button>
+</nav>
+
+<main class="app-body">
+
+  <section id="tab-upload" class="tab-panel active">
+    <div class="upload-grid">
+      <div class="upload-card">
+        <h3>HSBC Bermuda</h3>
+        <p class="hint">PDF statement</p>
+        <input type="file" id="hsbcFile" accept="application/pdf">
+      </div>
+      <div class="upload-card">
+        <h3>Monzo UK</h3>
+        <p class="hint">CSV export</p>
+        <input type="file" id="monzoFile" accept=".csv">
+      </div>
+      <div class="upload-card">
+        <h3>IBKR</h3>
+        <p class="hint">Flex Query CSV</p>
+        <input type="file" id="ibkrFile" accept=".csv">
+      </div>
+    </div>
+
+    <div class="review-section">
+      <h3>Review before saving <span class="count-badge" id="reviewCount">0</span></h3>
+      <p class="hint">Parsed rows land here first — edit anything that's wrong, remove anything that shouldn't be there, then commit. Nothing is written to Drive until you do.</p>
+      <div class="table-scroll">
+        <table id="reviewTable">
+          <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Amount</th><th>Source</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <button id="commitReviewBtn" class="btn btn-primary">Save reviewed rows to Drive</button>
+    </div>
+  </section>
+
+  <section id="tab-dashboard" class="tab-panel">
+    <div class="dash-grid">
+      <div class="card">
+        <h3>Income vs. spend by month</h3>
+        <canvas id="spendChart"></canvas>
+      </div>
+      <div class="card">
+        <h3>Spend by category (latest month)</h3>
+        <canvas id="categoryChart"></canvas>
+      </div>
+      <div class="card wide">
+        <h3>Investments</h3>
+        <p id="investSummary" class="hint">No IBKR data imported yet.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-transactions" class="tab-panel">
+    <div class="table-scroll">
+      <table id="txTable">
+        <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Amount</th><th>Source</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="tab-panel">
+    <h3>Category rules</h3>
+    <p class="hint">Keyword → category mapping, checked against each transaction description. Edit as JSON.</p>
+    <textarea id="rulesBox" class="code-box"></textarea>
+    <button id="saveRulesBtn" class="btn btn-primary">Save rules</button>
+
+    <h3>HSBC line pattern (advanced)</h3>
+    <p class="hint">Regex used to pull transaction lines out of the HSBC PDF text. Leave blank to use the default. Needs three capture groups: date, description, amount.</p>
+    <input id="hsbcRegex" class="code-box" style="height:auto" placeholder="(default pattern)">
+  </section>
+
+</main>
+
+<footer class="app-footer">
+  <p>All data lives only in your own Google Drive (app-private folder). This page never sends your statements or transactions anywhere else.</p>
+</footer>
+
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<!-- CSV parsing -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<!-- PDF text extraction -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";</script>
+<!-- Charts -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+
+<script src="config.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/drive.js"></script>
+<script src="js/parsers.js"></script>
+<script src="js/categorize.js"></script>
+<script src="js/dashboard.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
