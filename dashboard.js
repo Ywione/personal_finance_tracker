@@ -17,9 +17,16 @@ const Dashboard = (() => {
     return null;
   }
 
+  // Internal transfers (between the person's own accounts — HSBC↔HSBC,
+  // HSBC↔Monzo) are excluded: counting them would show every savings
+  // move as fake income in one account and fake spend in the other.
+  function isInternal(t) {
+    return t.category === "Internal Transfer";
+  }
+
   function summarize(transactions) {
     const byMonth = {};
-    transactions.forEach((t) => {
+    transactions.filter((t) => !isInternal(t)).forEach((t) => {
       const mk = monthKey(t.date);
       if (!byMonth[mk]) byMonth[mk] = { income: 0, spend: 0, net: 0 };
       if (t.amount >= 0) byMonth[mk].income += t.amount;
@@ -32,7 +39,7 @@ const Dashboard = (() => {
   function categoryBreakdown(transactions, month) {
     const byCat = {};
     transactions
-      .filter((t) => t.amount < 0 && (!month || monthKey(t.date) === month))
+      .filter((t) => t.amount < 0 && !isInternal(t) && (!month || monthKey(t.date) === month))
       .forEach((t) => {
         byCat[t.category || "Uncategorized"] = (byCat[t.category || "Uncategorized"] || 0) + Math.abs(t.amount);
       });
