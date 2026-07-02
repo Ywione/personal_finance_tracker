@@ -11,13 +11,17 @@ const Parsers = {};
 Parsers.monzo = function (fileText) {
   const parsed = Papa.parse(fileText, { header: true, skipEmptyLines: true });
   return parsed.data.map((row) => {
-    const moneyOut = parseFloat(row["Money Out"] || row["Amount"] || 0) || 0;
-    const moneyIn = parseFloat(row["Money In"] || 0) || 0;
-    const amount = row["Amount"] !== undefined && row["Money Out"] === undefined
-      ? parseFloat(row["Amount"]) || 0
-      : moneyIn + moneyOut; // Money Out is already negative in Monzo exports
+    // "Amount" is already the correct signed value (negative = spend,
+    // positive = income) in Monzo's export — Money Out/Money In are
+    // just a split view of the same number, not additional data.
+    let amount = parseFloat(row["Amount"]);
+    if (isNaN(amount)) {
+      const moneyOut = parseFloat(row["Money Out"]) || 0;
+      const moneyIn = parseFloat(row["Money In"]) || 0;
+      amount = moneyOut + moneyIn;
+    }
     return {
-      date: row["Date"],
+      date: normalizeUKDate(row["Date"]), // Monzo exports DD/MM/YYYY
       description: row["Name"] || row["Description"] || "",
       category: row["Category"] || "",
       amount,
@@ -28,13 +32,23 @@ Parsers.monzo = function (fileText) {
   }).filter((r) => r.date && !isNaN(r.amount));
 };
 
-// ---- IBKR (Flex Query CSV) ---------------------------------------
-// Standard multi-section Flex CSV: col1 = section name, col2 = "Header"|"Data".
-// We split into sections generically so this survives you adding/removing
-// sections in the Flex Query template later.
+function normalizeUKDate(str) {
+  if (!str) return "";
+  const m = String(str).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return str; // already ISO or unrecognized — leave as-is
+  const [, dd, mm, yyyy] = m;
+  return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+}
+
+// ---- IBKR (Activity Statement or Flex Query CSV) -------------------
+// IBKR's CSV export is a stack of sections, each either:
+//   - "horizontal": Section,Header,Col1,Col2,...  then  Section,Data,v1,v2,...
+//   - "vertical":   Section,Header,Field Name,Field Value  then one row per field
+// We parse generically so this works whether you export the default
+// Activity Statement or a custom Flex Query with more sections enabled.
 Parsers.ibkr = function (fileText) {
-  const lines = fileText.split(/\r?\n/).filter((l) => l.trim().length);
-  const sections = {}; // { sectionName: { headers: [...], rows: [[...]] } }
+  const lines = fileText.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim().length);
+  const sections = {};
 
   for (const line of lines) {
     const cols = splitCSVLine(line);
@@ -58,10 +72,35 @@ Parsers.ibkr = function (fileText) {
     });
   };
 
-  const trades = asObjects("Trades");
+  // "Vertical" sections (Change in NAV, Account Information, etc.) list
+  // one field per row as Field Name/Field Value — fold into a flat map.
+  const asFieldMap = (section) => {
+    const rows = asObjects(section);
+    const map = {};
+    rows.forEach((r) => {
+      if (r["Field Name"] !== undefined) map[r["Field Name"]] = r["Field Value"];
+    });
+    return map;
+  };
+
   const cashTx = asObjects("Cash Transactions");
   const deposits = asObjects("Deposits & Withdrawals");
-  const navRows = asObjects("Change in NAV");
+  const cashReport = asObjects("Cash Report");
+  const navMap = asFieldMap("Change in NAV");
+
+  // "Net Asset Value" is unusual: IBKR reuses the same section name for a
+  // second, differently-shaped header ("Time Weighted Rate of Return"),
+  // which breaks the generic header/row pairing above (a later header
+  // silently remaps every earlier row collected under the same section
+  // name). Scanning the raw lines directly sidesteps that.
+  let twrPct = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (/Time Weighted Rate of Return/i.test(lines[i])) {
+      const m = (lines[i + 1] || "").match(/([\d.]+)\s*%/);
+      if (m) twrPct = parseFloat(m[1]);
+      break;
+    }
+  }
 
   const txRows = [];
 
@@ -87,54 +126,212 @@ Parsers.ibkr = function (fileText) {
     });
   });
 
+  // Net deposits/withdrawals, month-to-date, from the Cash Report's
+  // "Base Currency Summary" row. Reported separately rather than folded
+  // into the NAV change above — the statement's own Starting/Ending
+  // Value can cover a shorter window (e.g. a single day) than "Month to
+  // Date", and subtracting one from the other would silently mix periods.
+  const findCash = (label) => {
+    const row = cashReport.find((r) => r["Currency Summary"] === label && r["Currency"] === "Base Currency Summary");
+    return row ? parseFloat(row["Month to Date"]) || 0 : 0;
+  };
+  const netFlowsMTD = findCash("Deposits") + findCash("Withdrawals");
+
   return {
     transactions: txRows.filter((r) => r.date && !isNaN(r.amount)),
-    trades,
-    nav: navRows, // used by dashboard.js for investment return calcs
+    nav: {
+      start: parseFloat(navMap["Starting Value"]),
+      end: parseFloat(navMap["Ending Value"]),
+      markToMarket: parseFloat(navMap["Mark-to-Market"]) || 0,
+      dividends: parseFloat(navMap["Dividends"]) || 0,
+      withholdingTax: parseFloat(navMap["Withholding Tax"]) || 0,
+      twrPct, // IBKR's own time-weighted return for this statement's period — the authoritative figure
+      netFlowsMTD,
+    },
   };
 };
 
-// ---- HSBC Bermuda (PDF statement) --------------------------------
-// PDF layouts vary a lot between banks and even between statement
-// eras from the same bank, so this uses a permissive line-level
-// regex and always routes results through the review screen before
-// anything is saved. Tune HSBC_LINE_RE in Settings if it misses rows.
-Parsers.hsbc = async function (arrayBuffer, customRegex) {
+// ---- HSBC Bermuda (scanned PDF statement, via in-browser OCR) -------
+// HSBC Bermuda's PDF statements have no text layer at all — they're
+// scanned images — so there's nothing for pdf.js to extract directly.
+// This renders each page to a canvas and runs OCR (Tesseract.js) on it
+// entirely in your browser; nothing is uploaded anywhere. The parsed
+// rows always land in the review table before anything is saved, since
+// OCR occasionally misreads a character.
+Parsers.hsbc = async function (arrayBuffer, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  let fullText = "";
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const pageText = content.items.map((it) => it.str).join(" ");
-    fullText += pageText + "\n";
-  }
+  const worker = await Tesseract.createWorker("eng");
+  const allLines = [];
 
-  // Default: "12 JAN  DESCRIPTION TEXT  1,234.56" style lines,
-  // with an optional leading minus/CR-DR marker.
-  const re = customRegex ||
-    /(\d{1,2}\s?[A-Z]{3})\s+(.+?)\s+(-?[\d,]+\.\d{2})(?:\s*(CR|DR))?\s*$/gm;
-
-  const rows = [];
-  let match;
-  while ((match = re.exec(fullText)) !== null) {
-    const [, dateStr, desc, amtStr, crdr] = match;
-    let amount = parseFloat(amtStr.replace(/,/g, ""));
-    if (crdr === "DR" || (!crdr && desc.toLowerCase().match(/withdrawal|debit|purchase|fee/))) {
-      amount = -Math.abs(amount);
-    } else if (crdr === "CR") {
-      amount = Math.abs(amount);
+  try {
+    for (let i = 1; i <= pdf.numPages; i++) {
+      if (onProgress) onProgress(`Reading page ${i} of ${pdf.numPages}…`);
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 4 }); // ~288dpi, good OCR accuracy
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      const { data } = await worker.recognize(canvas);
+      // Tesseract's own line grouping occasionally reads a table's
+      // columns as separate blocks (all the description text, then all
+      // the amounts, out of row order). Rebuilding rows from each
+      // word's own position is what makes this reliable regardless.
+      const pageLines = reflowWords(data.words);
+      allLines.push(...(pageLines.length ? pageLines : data.text.split(/\r?\n/)));
     }
-    rows.push({
-      date: dateStr,
-      description: desc.trim(),
-      amount,
-      currency: "BMD",
-      source: "hsbc",
-      raw: match[0],
-    });
+  } finally {
+    await worker.terminate();
   }
-  return rows;
+
+  return parseHsbcLines(allLines);
 };
+
+// Reconstructs reading-order lines from OCR word boxes: cluster words
+// into rows by y-position, then sort each row left-to-right by x.
+function reflowWords(words) {
+  if (!words || !words.length) return [];
+  const heights = words.map((w) => w.bbox.y1 - w.bbox.y0).filter((h) => h > 0);
+  const avgHeight = heights.reduce((a, b) => a + b, 0) / (heights.length || 1);
+  const tolerance = Math.max(8, avgHeight * 0.6);
+
+  const sorted = words.slice().sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
+  const rows = [];
+  for (const w of sorted) {
+    let row = rows.find((r) => Math.abs(r.y - w.bbox.y0) <= tolerance);
+    if (!row) {
+      row = { y: w.bbox.y0, words: [] };
+      rows.push(row);
+    }
+    row.words.push(w);
+  }
+  rows.sort((a, b) => a.y - b.y);
+  return rows.map((r) => r.words.sort((a, b) => a.bbox.x0 - b.bbox.x0).map((w) => w.text).join(" "));
+}
+
+// Reconstructs transactions from OCR'd statement lines using the
+// running balance: every "Deposits/Withdrawals/Balance" row shows the
+// new balance, so amount = newBalance - previousBalance. This sidesteps
+// having to trust OCR's read of which of two numbers on a line is the
+// transaction amount vs. the balance, and survives transactions that
+// get split across a page break (common — see BALANCE CARRIED/BROUGHT
+// FORWARD handling below).
+function parseHsbcLines(lines) {
+  const SKIP = [
+    /^HSBC\b/i, /^Page \d+ of \d+/i, /Composite Statement/i,
+    /STATEMENT AT A GLANCE/i, /STATEMENT DATE/i, /CUSTOMER NUMBER/i,
+    /SEQUENCE NUMBER/i, /DESPATCH CODE/i, /Your Portfolio At A Glance/i,
+    /TOTAL DEPOSITS AND INVESTMENTS/i, /TOTAL BORROWINGS/i, /NET POSITION/i,
+    /^MORTGAGES/i, /Summary of Your Portfolio/i, /CCY\/Unit/i, /Credit Limit/i,
+    /BMD Equivalent/i, /Protect Your Personal Information/i, /[Ff]raudster/i,
+    /purporting to be from/i, /ask customers to confirm/i,
+    /such requests please forward/i, /Important information/i,
+    /errors, omissions/i, /as of previous month end/i, /Details of Your Accounts/i,
+    /\(DR=Debit\)/i, /^Date\s+Transaction Details/i,
+    /Transaction Turnover/i, /Transaction Count/i, /^END OF STATEMENT/i,
+    /^BMD\s*$/i, /^USD\s*$/i, /^GBP\s*$/i,
+  ];
+  const BALANCE_MARKER = /(BALANCE BROUGHT FORWARD|BALANCE CARRIED FORWARD|CLOSING BALANCE)/i;
+  const ACCOUNT_HEADER = /Account Number\s*[:\-]?\s*([\d\-]+)/i;
+  const TABLE_HEADER = /^\(?Date\s+Transaction Details/i;
+  const NUM = /(-?[\d,]+\.\d{2})\s*(DR)?/gi;
+
+  let previousBalance = null;
+  let currentDate = null;
+  let account = null;
+  let buffer = [];
+  let tableActive = false; // gates out pre-table summary tables (e.g. "Summary of Your Portfolio")
+  const rows = [];
+
+  const parseAmount = (numStr, dr) => {
+    const v = parseFloat(numStr.replace(/,/g, ""));
+    return dr ? -Math.abs(v) : v;
+  };
+
+  for (let rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // The account/branch header line repeats at the top of every page for
+    // the SAME account (it's a running header, not a new section) — only
+    // treat it as a reset when the account number actually changes.
+    const acctMatch = line.match(ACCOUNT_HEADER);
+    if (acctMatch) {
+      if (acctMatch[1] !== account) {
+        account = acctMatch[1];
+        previousBalance = null;
+        currentDate = null;
+        buffer = [];
+        tableActive = false;
+      }
+      continue;
+    }
+
+    if (TABLE_HEADER.test(line)) {
+      tableActive = true;
+      continue;
+    }
+
+    if (SKIP.some((re) => re.test(line))) continue;
+    if (!tableActive) continue; // still in the pre-table summary section
+
+    // Pull a date token out if present (tolerant of OCR noise like "O06Apr2026")
+    const dateMatch = line.match(/(\d{1,2}[A-Za-z]{3}\d{4})/);
+    let working = line;
+    if (dateMatch) {
+      currentDate = normalizeHsbcDate(dateMatch[1]);
+      working = working.replace(dateMatch[0], "").trim();
+    }
+
+    if (BALANCE_MARKER.test(line)) {
+      const nums = [...working.matchAll(NUM)];
+      if (nums.length) {
+        const last = nums[nums.length - 1];
+        previousBalance = parseAmount(last[1], last[2]);
+      }
+      buffer = [];
+      continue;
+    }
+
+    const nums = [...working.matchAll(NUM)];
+    if (nums.length >= 2) {
+      const balTok = nums[nums.length - 1];
+      const amtTok = nums[nums.length - 2];
+      const newBalance = parseAmount(balTok[1], balTok[2]);
+      const amount = previousBalance !== null
+        ? Math.round((newBalance - previousBalance) * 100) / 100
+        : parseAmount(amtTok[1], null);
+
+      let desc = working.slice(0, amtTok.index).trim();
+      if (buffer.length) desc = (buffer.join(" ") + " " + desc).replace(/\s+/g, " ").trim();
+
+      rows.push({
+        date: currentDate,
+        description: desc || "(description unclear — OCR)",
+        amount,
+        currency: "BMD",
+        account,
+        source: "hsbc",
+        raw: line,
+      });
+      previousBalance = newBalance;
+      buffer = [];
+      continue;
+    }
+
+    if (working) buffer.push(working);
+  }
+
+  return rows;
+}
+
+function normalizeHsbcDate(tok) {
+  const m = tok.match(/(\d{1,2})([A-Za-z]{3})(\d{4})/);
+  if (!m) return tok;
+  const months = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+  const mm = months[m[2].toLowerCase()] || "01";
+  return `${m[3]}-${mm}-${m[1].padStart(2, "0")}`;
+}
 
 function splitCSVLine(line) {
   // Minimal CSV splitter that respects quoted commas.
