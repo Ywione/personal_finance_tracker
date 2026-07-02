@@ -160,7 +160,12 @@ Parsers.ibkr = function (fileText) {
 // OCR occasionally misreads a character.
 Parsers.hsbc = async function (arrayBuffer, onProgress) {
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const worker = await Tesseract.createWorker("eng");
+  const worker = await Tesseract.createWorker("eng", 1, {
+    workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@4.1.1/dist/worker.min.js",
+    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@4.0.4/tesseract-core-simd-lstm.wasm.js",
+    langPath: "https://tessdata.projectnaptha.com/4.0.0",
+    logger: (m) => { if (onProgress && m.status === "recognizing text") onProgress(`OCR ${Math.round((m.progress || 0) * 100)}%…`); },
+  });
   const allLines = [];
 
   try {
@@ -169,10 +174,12 @@ Parsers.hsbc = async function (arrayBuffer, onProgress) {
       const page = await pdf.getPage(i);
       const viewport = page.getViewport({ scale: 4 }); // ~288dpi, good OCR accuracy
       const canvas = document.createElement("canvas");
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
       await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-      const { data } = await worker.recognize(canvas);
+      // A data URL is the most broadly-supported input across Tesseract.js
+      // builds — more reliable than passing the canvas element directly.
+      const { data } = await worker.recognize(canvas.toDataURL("image/png"));
       // Tesseract's own line grouping occasionally reads a table's
       // columns as separate blocks (all the description text, then all
       // the amounts, out of row order). Rebuilding rows from each
