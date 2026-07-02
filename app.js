@@ -39,14 +39,16 @@ function initAuth() {
 }
 
 async function loadFromDrive() {
-  const [tx, rules, inv] = await Promise.all([
+  const [tx, rules, inv, model] = await Promise.all([
     DriveStore.readJSON(LEDGER_CONFIG.FILES.transactions, []),
     DriveStore.readJSON(LEDGER_CONFIG.FILES.rules, DEFAULT_RULES),
     DriveStore.readJSON(LEDGER_CONFIG.FILES.investments, []),
+    DriveStore.readJSON(LEDGER_CONFIG.FILES.model, null),
   ]);
   STATE.transactions = tx;
   STATE.navHistory = inv;
   Categorize.setRules(rules);
+  Categorize.setModel(model);
   renderRulesEditor();
   renderTransactionsTable();
   renderDashboard();
@@ -62,6 +64,7 @@ async function saveToDrive() {
       DriveStore.writeJSON(LEDGER_CONFIG.FILES.transactions, STATE.transactions),
       DriveStore.writeJSON(LEDGER_CONFIG.FILES.rules, Categorize.getRules()),
       DriveStore.writeJSON(LEDGER_CONFIG.FILES.investments, STATE.navHistory),
+      DriveStore.writeJSON(LEDGER_CONFIG.FILES.model, Categorize.getModel()),
     ]);
     return true;
   } catch (err) {
@@ -138,6 +141,12 @@ function renderReviewTable() {
     inp.addEventListener("change", (e) => {
       const { i, f } = e.target.dataset;
       STATE.pendingReview[i][f] = f === "amount" ? parseFloat(e.target.value) : e.target.value;
+      // A manual category correction is the strongest training signal —
+      // teach the classifier immediately so it recognizes this merchant
+      // next month.
+      if (f === "category") {
+        Categorize.learn(STATE.pendingReview[i].description, e.target.value);
+      }
     });
   });
   tbody.querySelectorAll(".del-row").forEach((btn) => {
@@ -149,6 +158,10 @@ function renderReviewTable() {
 }
 
 async function commitReview() {
+  // Committing is implicit confirmation of every row's category —
+  // reinforce the classifier with all of them (learn() skips
+  // Uncategorized rows itself).
+  STATE.pendingReview.forEach((t) => Categorize.learn(t.description, t.category));
   STATE.transactions = STATE.transactions.concat(STATE.pendingReview);
   STATE.pendingReview = [];
   renderReviewTable();
