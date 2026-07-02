@@ -13,8 +13,10 @@ const LEDGER_CONFIG = {
 
   // Filenames written inside the appDataFolder
   FILES: {
+    model: "ledger_nlp_model.json",
     transactions: "ledger_transactions.json",
     rules: "ledger_category_rules.json",
     investments: "ledger_investments.json",
+    
   },
 };
