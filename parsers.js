@@ -25,7 +25,7 @@ Parsers.monzo = function (fileText) {
     // or "Savings Pot" name) and any transfer referencing HSBC.
     const type = row["Type"] || "";
     const name = row["Name"] || "";
-    let category = row["Category"] || "";
+    let category = mapMonzoCategory(row["Category"] || "");
     if (/pot transfer/i.test(type) || /savings pot/i.test(name) || /hsbc/i.test(name + " " + (row["Description"] || ""))) {
       category = "Internal Transfer";
     }
@@ -47,6 +47,26 @@ function normalizeUKDate(str) {
   if (!m) return str; // already ISO or unrecognized — leave as-is
   const [, dd, mm, yyyy] = m;
   return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+}
+
+// The tracker's scheme IS Monzo's scheme, so this is near-identity:
+// normalize capitalization, route "General" (Monzo's catch-all) through
+// the rules + classifier instead of accepting it, and pass anything
+// unrecognized straight through so custom Monzo categories survive.
+function mapMonzoCategory(monzoCat) {
+  const raw = String(monzoCat || "").trim();
+  if (!raw) return "";
+  const key = raw.toLowerCase();
+  if (key === "general") return ""; // let rules/classifier pick something better
+  const canonical = {
+    "eating out": "Eating out", "groceries": "Groceries", "transport": "Transport",
+    "entertainment": "Entertainment", "shopping": "Shopping", "bills": "Bills",
+    "personal care": "Personal care", "holidays": "Holidays", "gifts": "Gifts",
+    "charity": "Charity", "family": "Family", "finances": "Finances",
+    "savings": "Savings", "income": "Income", "transfers": "Transfers", "cash": "Cash",
+    "expenses": "Finances",
+  };
+  return canonical[key] || raw;
 }
 
 // ---- IBKR (Activity Statement or Flex Query CSV) -------------------
@@ -411,7 +431,7 @@ function enrichHsbcBlock(blockLines, amount, ownAccounts) {
     category = "Income";
     counterparty = counterparty || "Credit interest";
   } else if (/Interactive Brokers/i.test(text) || /U8028484/i.test(text)) {
-    category = "Investing";
+    category = "Savings";
     counterparty = "Interactive Brokers (IBKR)";
   } else if (/MONZO/i.test(text)) {
     category = "Internal Transfer";
@@ -420,14 +440,14 @@ function enrichHsbcBlock(blockLines, amount, ownAccounts) {
     category = "Internal Transfer";
     counterparty = `Own account ${ownTransfer[1]}`;
   } else if (/\bTO\s+\d{3}-\d{6}-\d{3}/i.test(text)) {
-    category = "Transfer Out";
+    category = "Transfers";
     const acct = text.match(/TO\s+(\d{3}-\d{6}-\d{3})/i);
     counterparty = counterparty || (acct ? `Account ${acct[1]}` : "External transfer");
   } else if (/SAVINGS ACCOUNT FEE/i.test(text)) {
-    category = "Fees";
+    category = "Finances";
     counterparty = "Savings account fee";
   } else if (blockLines.some((l) => /^CASH\b/i.test(l.trim()))) {
-    category = amount < 0 ? "Cash Withdrawal" : "Cash Deposit";
+    category = "Cash";
     counterparty = counterparty || (amount < 0 ? "Cash withdrawal" : "Cash deposit");
   }
 
