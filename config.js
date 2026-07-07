@@ -6,17 +6,12 @@
 const LEDGER_CONFIG = {
   GOOGLE_CLIENT_ID: "1008976129886-u3a3tjhctmqptqs35tfa8thg5918rb9j.apps.googleusercontent.com",
 
-  // Drive scope: appdata = a hidden, app-private folder in the
-  // signed-in user's own Drive. No other app, and no person
-  // browsing their Drive normally, can see or read it.
-  DRIVE_SCOPE: "https://www.googleapis.com/auth/drive.appdata",
+  // The Google Sheet the app reads from and appends to. Paste the ID
+  // from the sheet's URL: docs.google.com/spreadsheets/d/<THIS_PART>/edit
+  SPREADSHEET_ID: "PASTE_YOUR_SPREADSHEET_ID_HERE",
 
-  // Filenames written inside the appDataFolder
-  FILES: {
-    model: "ledger_nlp_model.json",
-    transactions: "ledger_transactions.json",
-    rules: "ledger_category_rules.json",
-    investments: "ledger_investments.json",
-    
-  },
+  // Sheets scope: read/write access to spreadsheets the signed-in user
+  // opens with this app. Needed to append transactions and store the
+  // rules/model on hidden tabs.
+  SHEETS_SCOPE: "https://www.googleapis.com/auth/spreadsheets",
 };
