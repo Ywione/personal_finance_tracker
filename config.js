@@ -8,7 +8,7 @@ const LEDGER_CONFIG = {
 
   // The Google Sheet the app reads from and appends to. Paste the ID
   // from the sheet's URL: docs.google.com/spreadsheets/d/<THIS_PART>/edit
-  SPREADSHEET_ID: "PASTE_YOUR_SPREADSHEET_ID_HERE",
+  SPREADSHEET_ID: "1iNssTDWyaHKXe9TCtpL7s9LWG1nn6bV0ES3exiAW-vY",
 
   // Sheets scope: read/write access to spreadsheets the signed-in user
   // opens with this app. Needed to append transactions and store the
