@@ -395,10 +395,15 @@ function parseHsbcLines(lines) {
 function enrichHsbcBlock(blockLines, amount, ownAccounts) {
   const BOILER = [
     /^PURCHASE\b/i, /^CASH\b/i, /^REF\b/i, /^BK CHG\b/i, /^FCPT\b/i,
-    /^LP\b/i, /^TT\b/i, /^WEB-/i, /^[A-Z]{2}\d{6,}(USD|BMD|GBP|EUR)/,
+    /^LP\b/i, /^TT\b/i, /^WEB-/i,
+    // Currency+amount code lines like "IE649980USD 6.00" or "BM915537USD 31.50".
+    // OCR frequently misreads the leading letters (I→1, O→0, S→5), so match
+    // loosely: 1-2 leading alphanumerics, digits, a 3-letter currency, amount.
+    /^[A-Z0-9]{1,2}\d{4,}\s*(USD|BMD|GBP|EUR|USO|8MD)/i,
     /^\d{7,}$/, /^FROM\s+[\d\-]+/i, /^TO\s+[\d\-]+/i,
     /^SAVINGS ACCOUNT FEE/i, /^\d{2}[A-Z]{3}\d{2}\s+TO\s+\d{2}[A-Z]{3}\d{2}/i,
     /^CREDIT INTEREST/i, /^TRANSFER FROM$/i, /^COMMISSION\b/i,
+    /^Currency\s+[A-Z]{3}/i, // page-header fragment "Currency BMD ..."
   ];
   const text = blockLines.join(" ");
 
@@ -420,13 +425,47 @@ function enrichHsbcBlock(blockLines, amount, ownAccounts) {
   const textyLines = blockLines.filter((l) => !isJunk(l) && !BOILER.some((re) => re.test(l.trim())));
   let counterparty = textyLines.join(" ").replace(/\s+/g, " ").trim();
 
+  // Scrub embedded code fragments that OCR sometimes fuses into the name:
+  //  - leading currency/amount codes ("1E041305USD 6.00 FACEBK..." → "FACEBK...")
+  //  - "Currency BMD" page-header leak
+  //  - trailing "*XXXXXXXX22" transaction refs on card descriptors
+  counterparty = counterparty
+    .replace(/^[A-Z0-9]{1,2}\d{4,}\s*(?:USD|BMD|GBP|EUR|USO|8MD)\s*[\d,]*\.?\d*\s*/i, "")
+    .replace(/\bCurrency\s+[A-Z]{3}\s*/i, "")
+    .replace(/\s*\*[A-Z0-9]{6,}\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Canonicalise via the merchant bank: match the longest key that appears
+  // as a substring of the cleaned name (case-insensitive). This both fixes
+  // OCR spelling variants and yields a default category.
+  let bankCategory = "";
+  const hay = counterparty.toLowerCase();
+  if (typeof MERCHANT_BANK !== "undefined") {
+    let bestKey = "";
+    for (const key of Object.keys(MERCHANT_BANK)) {
+      if (hay.includes(key) && key.length > bestKey.length) bestKey = key;
+    }
+    if (bestKey) {
+      counterparty = MERCHANT_BANK[bestKey][0];
+      bankCategory = MERCHANT_BANK[bestKey][1];
+    }
+  }
+
   // Classification
   let category = "";
   const ownTransfer = text.match(/(?:FROM|TO)\s+(011-256617-\d{3})/i);
 
   if (/BERMUDA MONETARY AUT/i.test(text)) {
     category = "Income";
-    counterparty = "Bermuda Monetary Authority" + (counterparty ? ` — ${counterparty.replace(/BERMUDA MONETARY AUT/i, "").trim()}` : "");
+    // Keep the invoice reference if present (e.g. "BMA INVOICES", "INV 10"),
+    // but strip the OCR'd remnant of the "...AUTHORITY" word itself.
+    let ref = counterparty
+      .replace(/BERMUDA MONETARY AUT[A-Z]*/i, "")
+      .replace(/\b[a-z]?hority\b/i, "")
+      .replace(/^[\s—-]+/, "")
+      .trim();
+    counterparty = "Bermuda Monetary Authority" + (ref ? ` — ${ref}` : "");
   } else if (/CREDIT INTEREST/i.test(text)) {
     category = "Income";
     counterparty = counterparty || "Credit interest";
@@ -450,6 +489,9 @@ function enrichHsbcBlock(blockLines, amount, ownAccounts) {
     category = "Cash";
     counterparty = counterparty || (amount < 0 ? "Cash withdrawal" : "Cash deposit");
   }
+
+  // If no structural rule set a category, adopt the merchant bank's default.
+  if (!category && bankCategory) category = bankCategory;
 
   const description = counterparty || blockLines[blockLines.length - 1] || "(unclear — check raw)";
   return { counterparty, category, fxTax, description };
