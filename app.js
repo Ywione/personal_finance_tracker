@@ -235,7 +235,11 @@ function escapeHtml(s) {
 // ---- Init ---------------------------------------------------------
 document.addEventListener("DOMContentLoaded", () => {
   initTabs();
-  initAuth();
+  try {
+    initAuth();
+  } catch (err) {
+    console.error("Auth init failed:", err);
+  }
   initUploads();
   $("#commitReviewBtn").addEventListener("click", commitReview);
   $("#saveRulesBtn").addEventListener("click", saveRules);
