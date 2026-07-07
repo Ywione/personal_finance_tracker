@@ -39,14 +39,14 @@ function initAuth() {
 }
 
 async function loadFromDrive() {
-  const [tx, rules, inv, model] = await Promise.all([
-    DriveStore.readJSON(LEDGER_CONFIG.FILES.transactions, []),
-    DriveStore.readJSON(LEDGER_CONFIG.FILES.rules, DEFAULT_RULES),
-    DriveStore.readJSON(LEDGER_CONFIG.FILES.investments, []),
-    DriveStore.readJSON(LEDGER_CONFIG.FILES.model, null),
+  // Load from the Google Sheet (single source of truth).
+  const [tx, rules, model] = await Promise.all([
+    SheetStore.readAllTransactions(),
+    SheetStore.readRules(DEFAULT_RULES),
+    SheetStore.readModel(null),
   ]);
   STATE.transactions = tx;
-  STATE.navHistory = inv;
+  STATE.navHistory = [];
   Categorize.setRules(rules);
   Categorize.setModel(model);
   renderRulesEditor();
@@ -54,6 +54,8 @@ async function loadFromDrive() {
   renderDashboard();
 }
 
+// Persists rules + learned model to their hidden tabs. Transactions are
+// appended separately (in commitReview) so they can be deduped by Source ID.
 async function saveToDrive() {
   if (!Auth.isSignedIn()) {
     alert("You're not signed in — sign in with Google first, then re-import this file so it can be saved.");
@@ -61,15 +63,13 @@ async function saveToDrive() {
   }
   try {
     await Promise.all([
-      DriveStore.writeJSON(LEDGER_CONFIG.FILES.transactions, STATE.transactions),
-      DriveStore.writeJSON(LEDGER_CONFIG.FILES.rules, Categorize.getRules()),
-      DriveStore.writeJSON(LEDGER_CONFIG.FILES.investments, STATE.navHistory),
-      DriveStore.writeJSON(LEDGER_CONFIG.FILES.model, Categorize.getModel()),
+      SheetStore.writeRules(Categorize.getRules()),
+      SheetStore.writeModel(Categorize.getModel()),
     ]);
     return true;
   } catch (err) {
     console.error(err);
-    alert("Couldn't save to Drive: " + err.message);
+    alert("Couldn't save to the Sheet: " + err.message);
     return false;
   }
 }
@@ -158,17 +158,33 @@ function renderReviewTable() {
 }
 
 async function commitReview() {
-  // Committing is implicit confirmation of every row's category —
-  // reinforce the classifier with all of them (learn() skips
-  // Uncategorized rows itself).
+  if (!Auth.isSignedIn()) {
+    alert("Sign in with Google first, then commit.");
+    return;
+  }
+  // Committing confirms each row's category — reinforce the classifier.
   STATE.pendingReview.forEach((t) => Categorize.learn(t.description, t.category));
-  STATE.transactions = STATE.transactions.concat(STATE.pendingReview);
+
+  let result;
+  try {
+    result = await SheetStore.appendTransactions(STATE.pendingReview);
+  } catch (err) {
+    console.error(err);
+    alert("Couldn't write to the Sheet: " + err.message);
+    return;
+  }
+
+  // Persist rules + model, then refresh from the Sheet so the table
+  // reflects exactly what's stored (incl. server-side dedup).
+  await saveToDrive();
   STATE.pendingReview = [];
   renderReviewTable();
-  renderTransactionsTable();
-  const saved = await saveToDrive();
-  renderDashboard();
-  if (saved) alert("Saved to your private Drive folder.");
+  await loadFromDrive();
+
+  const msg = result.skipped
+    ? `Added ${result.appended} new transaction(s); skipped ${result.skipped} already in the Sheet.`
+    : `Added ${result.appended} transaction(s) to the Sheet.`;
+  alert(msg);
 }
 
 // ---- Transactions table ------------------------------------------------
@@ -235,11 +251,7 @@ function escapeHtml(s) {
 // ---- Init ---------------------------------------------------------
 document.addEventListener("DOMContentLoaded", () => {
   initTabs();
-  try {
-    initAuth();
-  } catch (err) {
-    console.error("Auth init failed:", err);
-  }
+  initAuth();
   initUploads();
   $("#commitReviewBtn").addEventListener("click", commitReview);
   $("#saveRulesBtn").addEventListener("click", saveRules);
