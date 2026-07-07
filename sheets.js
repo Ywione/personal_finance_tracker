@@ -12,6 +12,7 @@ const SheetStore = (() => {
   const TX_RANGE = "Transactions!A:L"; // 12 columns, matches the workbook
   const RULES_CELL = "_rules!A1";
   const MODEL_CELL = "_model!A1";
+  const MERCH_EDITS_RANGE = "_merchant_edits!A:C"; // key | clean name | category
 
   function sheetId() {
     const id = (LEDGER_CONFIG.SPREADSHEET_ID || "").trim();
@@ -99,22 +100,76 @@ const SheetStore = (() => {
     await authFetch(url, { method: "PUT", body: JSON.stringify({ values: [[JSON.stringify(obj)]] }) });
   }
 
+  // Update a transaction's Description (D) and Category (E) by row number.
+  // Row 2 = first data row (matches readAllTransactions order).
+  async function updateRows(updates) {
+    if (!updates.length) return;
+    const data = [];
+    for (const u of updates) {
+      if (u.description !== undefined)
+        data.push({ range: `${TX_SHEET}!D${u.rowNumber}`, values: [[u.description]] });
+      if (u.category !== undefined)
+        data.push({ range: `${TX_SHEET}!E${u.rowNumber}`, values: [[u.category]] });
+    }
+    await authFetch(`${API}/${sheetId()}/values:batchUpdate`, {
+      method: "POST",
+      body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
+    });
+  }
+
+  async function readMerchantEdits() {
+    try {
+      const url = `${API}/${sheetId()}/values/${encodeURIComponent(MERCH_EDITS_RANGE)}`;
+      const res = await authFetch(url);
+      const data = await res.json();
+      const out = {};
+      (data.values || []).slice(1).forEach((r) => {
+        if (r[0]) out[r[0].toLowerCase()] = { name: r[1] || "", category: r[2] || "" };
+      });
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  async function writeMerchantEdits(editsMap) {
+    const rows = [["Match key (lowercase)", "Clean name", "Category"]];
+    for (const [key, v] of Object.entries(editsMap)) rows.push([key, v.name, v.category]);
+    await authFetch(`${API}/${sheetId()}/values/${encodeURIComponent("_merchant_edits!A:C")}:clear`, { method: "POST", body: "{}" });
+    await authFetch(`${API}/${sheetId()}/values/${encodeURIComponent("_merchant_edits!A1")}?valueInputOption=RAW`,
+      { method: "PUT", body: JSON.stringify({ values: rows }) });
+  }
+
   async function readAllTransactions() {
     const url = `${API}/${sheetId()}/values/${encodeURIComponent(TX_RANGE)}`;
     const res = await authFetch(url);
     const data = await res.json();
     const vals = data.values || [];
     if (vals.length < 2) return [];
-    return vals.slice(1).filter((r) => r[0]).map((r) => ({
+    return vals.slice(1).map((r, idx) => ({
+      rowNumber: idx + 2, // header is row 1; first data row is 2
       date: r[0], bank: r[1], account: r[2], description: r[3], category: r[4],
       trip: r[5], currency: r[6], amount: parseFloat(r[7]) || 0,
       fxTax: parseFloat(r[9]) || 0, notes: r[10], id: r[11],
       source: (r[1] || "").toLowerCase(),
-    }));
+    })).filter((t) => t.date);
+  }
+
+  async function appendNav(nav, statementDate) {
+    const row = [
+      statementDate || new Date().toISOString().slice(0, 10),
+      nav.start ?? "", nav.end ?? "", nav.netFlowsMTD ?? "",
+      nav.markToMarket ?? "", nav.dividends ?? "", nav.withholdingTax ?? "",
+      typeof nav.twrPct === "number" ? nav.twrPct / 100 : "", // store as ratio for 0.00% format
+      "", // Cumulative — sheet formula fills it
+    ];
+    const url = `${API}/${sheetId()}/values/${encodeURIComponent("Investments!A:I")}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+    await authFetch(url, { method: "POST", body: JSON.stringify({ values: [row] }) });
   }
 
   return {
-    appendTransactions, readAllTransactions,
+    appendTransactions, readAllTransactions, appendNav,
+    updateRows, readMerchantEdits, writeMerchantEdits,
     readRules: (fb) => readJSONCell(RULES_CELL, fb),
     writeRules: (o) => writeJSONCell(RULES_CELL, o),
     readModel: (fb) => readJSONCell(MODEL_CELL, fb),

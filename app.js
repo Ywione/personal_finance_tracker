@@ -40,15 +40,17 @@ function initAuth() {
 
 async function loadFromDrive() {
   // Load from the Google Sheet (single source of truth).
-  const [tx, rules, model] = await Promise.all([
+  const [tx, rules, model, merchantEdits] = await Promise.all([
     SheetStore.readAllTransactions(),
     SheetStore.readRules(DEFAULT_RULES),
     SheetStore.readModel(null),
+    SheetStore.readMerchantEdits(),
   ]);
   STATE.transactions = tx;
   STATE.navHistory = [];
   Categorize.setRules(rules);
   Categorize.setModel(model);
+  if (typeof setMerchantOverrides === "function") setMerchantOverrides(merchantEdits);
   renderRulesEditor();
   renderTransactionsTable();
   renderDashboard();
@@ -77,42 +79,61 @@ async function saveToDrive() {
 // ---- Upload → parse → review pipeline --------------------------------
 function initUploads() {
   $("#monzoFile").addEventListener("change", async (e) => {
-    const text = await e.target.files[0].text();
-    queueReview(Categorize.applyTo(Parsers.monzo(text)));
+    const files = Array.from(e.target.files);
+    let total = 0;
+    for (const file of files) {
+      const text = await file.text();
+      const rows = Categorize.applyTo(Parsers.monzo(text));
+      queueReview(rows);
+      total += rows.length;
+    }
+    if (files.length > 1) alert(`Parsed ${files.length} Monzo files — ${total} row(s) added to review.`);
+    e.target.value = ""; // reset so re-selecting the same files fires change again
   });
 
   $("#ibkrFile").addEventListener("change", async (e) => {
-    const text = await e.target.files[0].text();
-    const result = Parsers.ibkr(text);
-    if (result.transactions.length) queueReview(Categorize.applyTo(result.transactions));
-    if (!isNaN(result.nav.start) && !isNaN(result.nav.end)) {
-      STATE.navHistory.push({ importedAt: new Date().toISOString(), nav: result.nav });
-      await saveToDrive();
-      renderDashboard();
+    const files = Array.from(e.target.files);
+    let navCount = 0, txCount = 0, navErr = 0;
+    for (const file of files) {
+      const text = await file.text();
+      const result = Parsers.ibkr(text);
+      if (result.transactions.length) { queueReview(Categorize.applyTo(result.transactions)); txCount += result.transactions.length; }
+      if (!isNaN(result.nav.start) && !isNaN(result.nav.end)) {
+        STATE.navHistory.push({ importedAt: new Date().toISOString(), nav: result.nav });
+        try { await SheetStore.appendNav(result.nav, result.nav.statementDate); navCount++; }
+        catch (err) { console.error(err); navErr++; }
+      }
     }
-    if (!result.transactions.length && isNaN(result.nav.start)) {
-      alert("Didn't find a Change in NAV or transaction section in this file — check it's an IBKR Activity Statement or Flex Query CSV.");
-    } else {
-      alert("Investment return updated on the Dashboard tab" + (result.transactions.length ? ` and ${result.transactions.length} row(s) added to review.` : "."));
-    }
+    renderDashboard();
+    let msg = `Processed ${files.length} IBKR file(s): ${navCount} NAV snapshot(s) recorded`;
+    if (txCount) msg += `, ${txCount} transaction row(s) to review`;
+    if (navErr) msg += ` (${navErr} failed to write — see console)`;
+    alert(msg + ".");
+    e.target.value = "";
   });
 
   $("#hsbcFile").addEventListener("change", async (e) => {
-    const file = e.target.files[0];
+    const files = Array.from(e.target.files);
     const statusEl = $("#hsbcStatus");
-    const buf = await file.arrayBuffer();
-    try {
-      const rows = await Parsers.hsbc(buf, (msg) => { statusEl.textContent = msg; });
-      statusEl.textContent = `Done — ${rows.length} row(s) found. Check them below before saving.`;
-      if (!rows.length) {
-        alert("No transactions were recognized. The scan quality or layout may be throwing off OCR — try re-exporting the PDF, or paste a page of the extracted text to me in chat and I can tune the parser.");
+    let total = 0, failed = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const prefix = files.length > 1 ? `File ${i + 1}/${files.length} (${file.name}): ` : "";
+      try {
+        const buf = await file.arrayBuffer();
+        const rows = await Parsers.hsbc(buf, (msg) => { statusEl.textContent = prefix + msg; });
+        queueReview(Categorize.applyTo(rows));
+        total += rows.length;
+        if (!rows.length) failed++;
+      } catch (err) {
+        console.error(err);
+        failed++;
+        statusEl.textContent = prefix + "OCR failed — see console.";
       }
-      queueReview(Categorize.applyTo(rows));
-    } catch (err) {
-      statusEl.textContent = "OCR failed — see console for details.";
-      console.error(err);
-      alert("Something went wrong reading the PDF: " + err.message);
     }
+    statusEl.textContent = `Done — ${total} row(s) found across ${files.length} statement(s)` + (failed ? `; ${failed} file(s) yielded nothing (check them).` : ". Review below before saving.");
+    if (!total) alert("No transactions were recognized in any file. Scan quality or layout may be throwing off OCR.");
+    e.target.value = "";
   });
 }
 
@@ -187,6 +208,116 @@ async function commitReview() {
   alert(msg);
 }
 
+// ---- Sync from Sheet: learn from edits made directly in the spreadsheet ----
+// Treats the Transactions tab as ground truth. For every row it trains the
+// classifier on (description → category), and detects merchant-name/category
+// corrections, recording them to _merchant_edits and propagating them to
+// every other row of the same merchant (written back to the sheet).
+async function syncFromSheet() {
+  if (!Auth.isSignedIn()) { alert("Sign in first."); return; }
+  let txs, existingEdits;
+  try {
+    [txs, existingEdits] = await Promise.all([
+      SheetStore.readAllTransactions(),
+      SheetStore.readMerchantEdits(),
+    ]);
+  } catch (err) { console.error(err); alert("Couldn't read the Sheet: " + err.message); return; }
+
+  let trained = 0;
+  txs.forEach((t) => {
+    if (t.category && t.category !== "Uncategorized") { Categorize.learn(t.description, t.category); trained++; }
+  });
+
+  const edits = { ...existingEdits };
+  const merchantGroups = {};
+  for (const t of txs) {
+    const key = normalizeMerchantKey(t.description);
+    if (!key) continue;
+    if (!merchantGroups[key]) merchantGroups[key] = { rows: [] };
+    merchantGroups[key].rows.push(t);
+  }
+
+  const updates = [];
+  for (const [key, grp] of Object.entries(merchantGroups)) {
+    const nameVotes = {}, catVotes = {};
+    grp.rows.forEach((t) => {
+      nameVotes[t.description] = (nameVotes[t.description] || 0) + 1;
+      if (t.category) catVotes[t.category] = (catVotes[t.category] || 0) + 1;
+    });
+    const bestName = Object.entries(nameVotes).sort((a, b) => b[1] - a[1])[0][0];
+    const bestCat = Object.entries(catVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+
+    const resolved = (typeof resolveMerchant === "function") ? resolveMerchant(bestName) : null;
+    if (!resolved || resolved.name !== bestName || (bestCat && resolved.category !== bestCat)) {
+      edits[key] = { name: bestName, category: bestCat };
+    }
+
+    grp.rows.forEach((t) => {
+      const needsName = t.description !== bestName;
+      const needsCat = bestCat && t.category !== bestCat;
+      if (needsName || needsCat) {
+        updates.push({
+          rowNumber: t.rowNumber,
+          ...(needsName ? { description: bestName } : {}),
+          ...(needsCat ? { category: bestCat } : {}),
+        });
+      }
+    });
+  }
+
+  try {
+    if (typeof setMerchantOverrides === "function") setMerchantOverrides(edits);
+    await SheetStore.writeMerchantEdits(edits);
+    if (updates.length) await SheetStore.updateRows(updates);
+    await saveToDrive();
+    await loadFromDrive();
+  } catch (err) { console.error(err); alert("Sync write failed: " + err.message); return; }
+
+  alert(`Synced: trained on ${trained} row(s), ${Object.keys(edits).length} merchant rule(s), propagated ${updates.length} correction(s).`);
+}
+
+// Normalizes a description to a merchant grouping key so OCR variants and
+// your cleaned names collapse together: lowercase, strip ref codes and long
+// digit runs, keep the first ~3 identifying tokens.
+function normalizeMerchantKey(desc) {
+  return String(desc || "")
+    .toLowerCase()
+    .replace(/\*[a-z0-9]{6,}/g, "")
+    .replace(/[^a-z0-9'&\s]/g, " ")
+    .replace(/\b\d{4,}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ").slice(0, 3).join(" ");
+}
+
+// Generates a copy-paste block of merchant-bank entries from the corrections
+// accumulated in the sheet, ready to fold into the committed merchant_bank.js.
+// This is the deliberate manual step that keeps GitHub the canonical source.
+async function generateMerchantBankExport() {
+  if (!Auth.isSignedIn()) { alert("Sign in first."); return; }
+  const edits = await SheetStore.readMerchantEdits();
+  const keys = Object.keys(edits);
+  if (!keys.length) { alert("No merchant corrections recorded yet — make edits in the sheet, Sync, then export."); return; }
+  const lines = keys.sort().map((k) => {
+    const { name, category } = edits[k];
+    const esc = (s) => String(s).replace(/"/g, '\\"');
+    return `  "${esc(k)}": ["${esc(name)}", "${esc(category)}"],`;
+  });
+  const block =
+    "// ── Folded-in corrections from the spreadsheet (" + new Date().toISOString().slice(0, 10) + ") ──\n" +
+    "// Paste these entries into the MERCHANT_BANK object in merchant_bank.js,\n" +
+    "// then commit. Existing keys with the same name are overrides.\n" +
+    lines.join("\n");
+  // Show in a textarea overlay for easy copy.
+  const box = $("#rulesBox");
+  box.value = block;
+  $all(".tab-btn").forEach((b) => b.classList.remove("active"));
+  $all(".tab-panel").forEach((p) => p.classList.remove("active"));
+  document.querySelector('.tab-btn[data-tab="settings"]').classList.add("active");
+  $("#tab-settings").classList.add("active");
+  alert(`Generated ${keys.length} merchant entries in the Settings box below — copy into merchant_bank.js and commit.`);
+}
+
 // ---- Transactions table ------------------------------------------------
 function renderTransactionsTable() {
   const tbody = $("#txTable tbody");
@@ -255,4 +386,8 @@ document.addEventListener("DOMContentLoaded", () => {
   initUploads();
   $("#commitReviewBtn").addEventListener("click", commitReview);
   $("#saveRulesBtn").addEventListener("click", saveRules);
+  const syncBtn = $("#syncSheetBtn");
+  if (syncBtn) syncBtn.addEventListener("click", syncFromSheet);
+  const exportBtn = $("#exportMerchantsBtn");
+  if (exportBtn) exportBtn.addEventListener("click", generateMerchantBankExport);
 });

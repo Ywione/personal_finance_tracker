@@ -166,6 +166,15 @@ Parsers.ibkr = function (fileText) {
   };
   const netFlowsMTD = findCash("Deposits") + findCash("Withdrawals");
 
+  // Statement period date (from the Statement section) — dates the NAV row.
+  let statementDate = "";
+  const stmtRows = asObjects("Statement");
+  const periodRow = stmtRows.find((r) => r["Field Name"] === "Period");
+  if (periodRow && periodRow["Field Value"]) {
+    const d = new Date(periodRow["Field Value"].replace(/"/g, "").split(" - ").pop());
+    if (!isNaN(d)) statementDate = d.toISOString().slice(0, 10);
+  }
+
   return {
     transactions: txRows.filter((r) => r.date && !isNaN(r.amount)),
     nav: {
@@ -174,8 +183,9 @@ Parsers.ibkr = function (fileText) {
       markToMarket: parseFloat(navMap["Mark-to-Market"]) || 0,
       dividends: parseFloat(navMap["Dividends"]) || 0,
       withholdingTax: parseFloat(navMap["Withholding Tax"]) || 0,
-      twrPct, // IBKR's own time-weighted return for this statement's period — the authoritative figure
+      twrPct,
       netFlowsMTD,
+      statementDate,
     },
   };
 };
@@ -436,20 +446,13 @@ function enrichHsbcBlock(blockLines, amount, ownAccounts) {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Canonicalise via the merchant bank: match the longest key that appears
-  // as a substring of the cleaned name (case-insensitive). This both fixes
-  // OCR spelling variants and yields a default category.
+  // Canonicalise via the merchant bank (+ sheet overrides): match the
+  // longest key appearing in the cleaned name. Fixes OCR spelling variants
+  // and yields a default category.
   let bankCategory = "";
-  const hay = counterparty.toLowerCase();
-  if (typeof MERCHANT_BANK !== "undefined") {
-    let bestKey = "";
-    for (const key of Object.keys(MERCHANT_BANK)) {
-      if (hay.includes(key) && key.length > bestKey.length) bestKey = key;
-    }
-    if (bestKey) {
-      counterparty = MERCHANT_BANK[bestKey][0];
-      bankCategory = MERCHANT_BANK[bestKey][1];
-    }
+  if (typeof resolveMerchant === "function") {
+    const hit = resolveMerchant(counterparty);
+    if (hit) { counterparty = hit.name; bankCategory = hit.category; }
   }
 
   // Classification
