@@ -857,3 +857,28 @@ const MERCHANT_BANK = {
     "Bills"
   ]
 };
+
+// Runtime overrides layered on top of the committed bank. Populated from the
+// spreadsheet's _merchant_edits tab on sync, so your in-sheet corrections take
+// effect immediately and travel across devices — while the committed bank
+// above stays the canonical baseline you periodically fold edits back into.
+let MERCHANT_OVERRIDES = {};
+function setMerchantOverrides(map) { MERCHANT_OVERRIDES = map || {}; }
+
+// Resolve a cleaned description to {name, category} using overrides first,
+// then the committed bank, via longest-substring match.
+function resolveMerchant(cleanedDescription) {
+  const hay = (cleanedDescription || "").toLowerCase();
+  let bestKey = "", best = null;
+  for (const key of Object.keys(MERCHANT_OVERRIDES)) {
+    if (hay.includes(key) && key.length > bestKey.length) {
+      bestKey = key; best = { name: MERCHANT_OVERRIDES[key].name, category: MERCHANT_OVERRIDES[key].category };
+    }
+  }
+  for (const key of Object.keys(MERCHANT_BANK)) {
+    if (hay.includes(key) && key.length > bestKey.length) {
+      bestKey = key; best = { name: MERCHANT_BANK[key][0], category: MERCHANT_BANK[key][1] };
+    }
+  }
+  return best; // null if nothing matched
+}

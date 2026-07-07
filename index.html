@@ -35,19 +35,19 @@
     <div class="upload-grid">
       <div class="upload-card">
         <h3>HSBC Bermuda</h3>
-        <p class="hint">PDF statement — scanned, so this reads it with in-browser OCR (~1–2 min for a full statement, all done locally)</p>
-        <input type="file" id="hsbcFile" accept="application/pdf">
+        <p class="hint">PDF statements — scanned, so this reads them with in-browser OCR (~1–2 min each, all local). You can select several at once to backfill months.</p>
+        <input type="file" id="hsbcFile" accept="application/pdf" multiple>
         <p id="hsbcStatus" class="hint" style="margin-top:8px"></p>
       </div>
       <div class="upload-card">
         <h3>Monzo UK</h3>
-        <p class="hint">CSV export</p>
-        <input type="file" id="monzoFile" accept=".csv">
+        <p class="hint">CSV export — select one or several</p>
+        <input type="file" id="monzoFile" accept=".csv" multiple>
       </div>
       <div class="upload-card">
         <h3>IBKR</h3>
-        <p class="hint">Flex Query CSV</p>
-        <input type="file" id="ibkrFile" accept=".csv">
+        <p class="hint">Activity Statement / Flex Query CSV — select one or several</p>
+        <input type="file" id="ibkrFile" accept=".csv" multiple>
       </div>
     </div>
 
@@ -91,7 +91,13 @@
   </section>
 
   <section id="tab-settings" class="tab-panel">
-    <h3>Category rules</h3>
+    <h3>Sync with spreadsheet</h3>
+    <p class="hint">Edited the Google Sheet directly — fixed a category or cleaned a merchant name? Sync pulls those in: it trains the classifier on your corrections and propagates each merchant fix to all matching transactions.</p>
+    <button id="syncSheetBtn" class="btn btn-primary">Sync from Sheet</button>
+    <button id="exportMerchantsBtn" class="btn">Generate merchant_bank.js additions</button>
+    <p class="hint" style="margin-top:8px">Export produces a copy-paste block of your merchant corrections to fold into the committed merchant_bank.js in GitHub — periodic, keeps the repo canonical.</p>
+
+    <h3 style="margin-top:24px">Category rules</h3>
     <p class="hint">Keyword → category mapping, checked against each transaction description. Edit as JSON.</p>
     <textarea id="rulesBox" class="code-box"></textarea>
     <button id="saveRulesBtn" class="btn btn-primary">Save rules</button>
